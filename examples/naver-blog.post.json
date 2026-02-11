@@ -1,0 +1,10 @@
+{
+  "blogId": "",
+  "title": "자동화 테스트 글 (발행하지 않음)",
+  "content": "이 글은 네이버 블로그 글쓰기 자동화 로직 테스트용입니다.\n\n- 제목/본문 입력\n- 카테고리/태그/공개설정(옵션)\n- 이미지 첨부(옵션)\n\n주의: publish=false 이므로 발행 버튼은 누르지 않습니다.",
+  "category": "",
+  "tags": ["자동화", "테스트"],
+  "visibility": "public",
+  "images": [],
+  "publish": false
+}

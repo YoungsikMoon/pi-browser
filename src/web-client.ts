@@ -8,6 +8,15 @@ import { WebSocketServer, WebSocket } from "ws";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import {
+  loadWorkflows,
+  loadWorkflow,
+  saveWorkflow,
+  deleteWorkflow,
+  generateWorkflowId,
+  type Workflow,
+  type WorkflowStep,
+} from "./workflow/index.js";
 
 // 설정 파일 경로
 const CONFIG_DIR = path.join(os.homedir(), ".pi-browser");
@@ -99,20 +108,31 @@ export function scanChromeProfiles(): ChromeProfile[] {
         const prefsPath = path.join(profilePath, "Preferences");
 
         let displayName = entry.name;
+        let email = "";
 
         if (fs.existsSync(prefsPath)) {
           try {
             const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+
+            // 이메일 주소 가져오기 (account_info에서)
+            if (prefs.account_info && Array.isArray(prefs.account_info) && prefs.account_info.length > 0) {
+              email = prefs.account_info[0].email || "";
+            }
+
+            // 프로필 이름
             if (prefs.profile?.name) {
               displayName = prefs.profile.name;
             }
           } catch {}
         }
 
+        // 이메일이 있으면 이메일 표시, 없으면 프로필 이름 표시
+        const finalDisplayName = email ? `📧 ${email}` : `👤 ${displayName}`;
+
         profiles.push({
           name: entry.name,
           path: profilePath,
-          displayName: `👤 ${displayName}`,
+          displayName: finalDisplayName,
         });
       }
     }
@@ -482,6 +502,264 @@ const HTML_PAGE = `<!DOCTYPE html>
     }
     .alert-success { background: #1a3a1a; border: 2px solid #27ae60; color: #2ecc71; }
     .alert-error { background: #3a1a1a; border: 2px solid #e74c3c; color: #e74c3c; }
+
+    /* 워크플로우 스타일 */
+    .workflows-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 15px;
+      margin-top: 15px;
+    }
+    .workflow-card {
+      background: rgba(10,10,30,0.9);
+      padding: 15px;
+      border: 1px solid rgba(0,217,255,0.2);
+      clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+      transition: all 0.3s;
+    }
+    .workflow-card:hover {
+      border-color: rgba(0,217,255,0.5);
+      box-shadow: 0 0 20px rgba(0,217,255,0.15);
+    }
+    .workflow-card.disabled {
+      opacity: 0.5;
+    }
+    .workflow-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .workflow-name {
+      font-size: 14px;
+      color: #00d9ff;
+      font-weight: bold;
+    }
+    .workflow-desc {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 10px;
+    }
+    .workflow-meta {
+      font-size: 10px;
+      color: #666;
+      display: flex;
+      gap: 15px;
+    }
+    .workflow-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .workflow-actions button {
+      padding: 5px 10px;
+      font-size: 11px;
+    }
+
+    /* 단계 편집기 */
+    .step-card {
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(0,217,255,0.2);
+      padding: 15px;
+      margin-bottom: 10px;
+      position: relative;
+    }
+    .step-controls {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      display: flex;
+      gap: 5px;
+    }
+    .step-move, .step-delete {
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(0,217,255,0.3);
+      color: #00d9ff;
+      width: 24px;
+      height: 24px;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+    .step-move:hover {
+      background: rgba(0,217,255,0.2);
+      border-color: #00d9ff;
+    }
+    .step-move:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    .step-delete {
+      background: rgba(231,76,60,0.3);
+      border-color: #e74c3c;
+      color: #e74c3c;
+    }
+    .step-delete:hover {
+      background: rgba(231,76,60,0.5);
+    }
+    .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid rgba(0,217,255,0.1);
+      padding-right: 90px;
+    }
+    .step-number {
+      background: linear-gradient(135deg, #00d9ff, #0077ff);
+      color: white;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: bold;
+    }
+    .step-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .step-row label {
+      min-width: 80px;
+      color: #888;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+    }
+    .step-row input, .step-row select {
+      flex: 1;
+      min-width: 150px;
+    }
+
+    .prompt-container {
+      margin-top: 12px;
+    }
+    .prompt-input {
+      width: 100%;
+      min-height: 120px;
+      padding: 12px;
+      background: rgba(0,20,40,0.8);
+      border: 1px solid rgba(0,217,255,0.3);
+      color: #fff;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.5;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+    .prompt-input:focus {
+      outline: none;
+      border-color: #00d9ff;
+      box-shadow: 0 0 10px rgba(0,217,255,0.2);
+    }
+    .prompt-input::placeholder {
+      color: #556;
+      font-size: 12px;
+    }
+    .advanced-options {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px dashed rgba(0,217,255,0.2);
+    }
+    .advanced-options summary {
+      cursor: pointer;
+      color: #888;
+      font-size: 12px;
+      user-select: none;
+    }
+    .advanced-options summary:hover {
+      color: #00d9ff;
+    }
+    .advanced-options[open] summary {
+      margin-bottom: 10px;
+    }
+    .schedule-section {
+      background: rgba(0,100,150,0.1);
+      border: 1px solid rgba(0,217,255,0.2);
+      padding: 15px;
+      margin-top: 15px;
+    }
+    .schedule-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .schedule-row label {
+      min-width: 80px;
+      color: #888;
+    }
+    .run-log-wf-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      margin-bottom: 5px;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(0,217,255,0.1);
+      cursor: pointer;
+      transition: all 0.2s;
+      font-size: 12px;
+    }
+    .run-log-wf-item:hover {
+      background: rgba(0,217,255,0.1);
+      border-color: rgba(0,217,255,0.3);
+    }
+    .run-log-wf-item.active {
+      background: rgba(0,217,255,0.2);
+      border-color: #00d9ff;
+      cursor: default;
+    }
+    .run-log-wf-status {
+      font-size: 10px;
+    }
+    .run-log-wf-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .mission-section {
+      background: rgba(0,50,100,0.2);
+      border: 1px solid rgba(0,217,255,0.3);
+      padding: 15px;
+    }
+    .mission-input {
+      width: 100%;
+      min-height: 150px;
+      padding: 15px;
+      background: rgba(0,20,40,0.9);
+      border: 2px solid rgba(0,217,255,0.4);
+      color: #fff;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1.6;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+    .mission-input:focus {
+      outline: none;
+      border-color: #00d9ff;
+      box-shadow: 0 0 15px rgba(0,217,255,0.3);
+    }
+    .mission-input::placeholder {
+      color: #556;
+      font-size: 13px;
+    }
+    .steps-advanced {
+      border: 1px dashed rgba(0,217,255,0.2);
+      padding: 10px 15px;
+    }
+    .steps-advanced[open] {
+      border-style: solid;
+    }
   </style>
 </head>
 <body>
@@ -490,6 +768,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
     <div class="tabs">
       <button class="tab active" onclick="showTab('tasks')">📋 작업</button>
+      <button class="tab" onclick="showTab('workflows')">🔄 워크플로우</button>
       <button class="tab" onclick="showTab('settings')">⚙️ 설정</button>
     </div>
 
@@ -532,6 +811,143 @@ const HTML_PAGE = `<!DOCTYPE html>
       </div>
 
       <div class="tasks-grid" id="tasksGrid"></div>
+    </div>
+
+    <!-- 워크플로우 탭 -->
+    <div id="tab-workflows" class="tab-content">
+      <div id="workflowAlert"></div>
+
+      <!-- 워크플로우 목록 -->
+      <div id="workflowList" class="settings-section">
+        <h3>📁 저장된 워크플로우 <button class="btn-primary btn-sm" onclick="createNewWorkflow()">+ 새로 만들기</button></h3>
+        <div style="margin:15px 0;display:flex;align-items:center;gap:10px;">
+          <label style="color:#888;">🖥️ 브라우저:</label>
+          <select id="wfProfile" class="cyber-select" style="max-width:300px;">
+            <option value="">로딩 중...</option>
+          </select>
+        </div>
+        <div id="workflowsGrid" class="workflows-grid"></div>
+        <div id="noWorkflows" style="color:#666;padding:20px;text-align:center;display:none;">
+          저장된 워크플로우가 없습니다. 새로 만들어보세요!
+        </div>
+      </div>
+
+      <!-- 워크플로우 편집기 (숨김) -->
+      <div id="workflowEditor" class="settings-section" style="display:none;">
+        <h3 id="editorTitle">✏️ 워크플로우 편집</h3>
+
+        <div class="form-group">
+          <label>이름 *</label>
+          <input type="text" id="wfName" placeholder="예: 네이버 메일 확인" />
+        </div>
+
+        <div class="form-group">
+          <label>설명</label>
+          <input type="text" id="wfDescription" placeholder="예: 로그인 후 안 읽은 메일 수 확인" />
+        </div>
+
+        <div class="form-group">
+          <div class="toggle-group">
+            <label class="toggle">
+              <input type="checkbox" id="wfEnabled" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <span>활성화</span>
+          </div>
+        </div>
+
+        <h4 style="color:#00d9ff;margin:20px 0 15px;">🤖 미션</h4>
+        <div class="mission-section">
+          <textarea id="wfMission" class="mission-input" placeholder="AI에게 시킬 작업을 자연어로 작성하세요. AI가 알아서 처리합니다.
+
+예시:
+• 쿠팡에 접속해서 최근 주문내역을 가져와줘
+• 네이버 메일에 로그인해서 안 읽은 메일이 몇 개인지 알려줘
+• 인스타그램에서 내 팔로워 수를 확인해줘
+• 아마존에서 장바구니에 뭐가 있는지 알려줘
+• 은행 사이트에서 계좌 잔액을 확인해줘"></textarea>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px;">
+            <span style="color:#666;font-size:11px;">최대 턴 수:</span>
+            <input type="number" id="wfMaxTurns" value="30" min="5" max="100" style="width:60px;padding:4px 8px;background:#222;border:1px solid #333;border-radius:4px;color:#fff;">
+            <span style="color:#666;font-size:11px;">💡 AI가 자동으로 사이트 접속, 로그인 상태 확인, 정보 수집을 처리합니다.</span>
+          </div>
+        </div>
+
+        <details class="steps-advanced" style="margin-top:20px;">
+          <summary style="color:#888;cursor:pointer;">📋 고급: 단계별 실행 (선택사항)</summary>
+          <div style="padding:15px 0;">
+            <div id="stepsContainer"></div>
+            <button class="btn-secondary btn-sm" onclick="addStep()">+ 단계 추가</button>
+          </div>
+        </details>
+
+        <h4 style="color:#00d9ff;margin:20px 0 15px;">⏰ 스케줄</h4>
+        <div class="schedule-section">
+          <div class="schedule-row">
+            <label class="toggle">
+              <input type="checkbox" id="scheduleEnabled" onchange="updateSchedule()">
+              <span class="toggle-slider"></span>
+            </label>
+            <span>자동 실행 활성화</span>
+          </div>
+          <div id="scheduleOptions" style="display:none;">
+            <div class="schedule-row">
+              <label>실행 주기</label>
+              <select id="scheduleType" onchange="updateScheduleType()">
+                <option value="interval">일정 간격</option>
+                <option value="daily">매일</option>
+                <option value="weekly">매주</option>
+              </select>
+            </div>
+            <div id="intervalOptions" class="schedule-row">
+              <label>간격</label>
+              <input type="number" id="intervalMinutes" value="60" min="1" max="1440" style="width:80px;" onchange="updateSchedule()">
+              <span>분마다</span>
+            </div>
+            <div id="dailyOptions" class="schedule-row" style="display:none;">
+              <label>시간</label>
+              <input type="time" id="scheduleTime" value="09:00" onchange="updateSchedule()">
+            </div>
+            <div id="weeklyOptions" class="schedule-row" style="display:none;">
+              <label>요일</label>
+              <select id="scheduleDayOfWeek" onchange="updateSchedule()">
+                <option value="0">일요일</option>
+                <option value="1">월요일</option>
+                <option value="2">화요일</option>
+                <option value="3">수요일</option>
+                <option value="4">목요일</option>
+                <option value="5">금요일</option>
+                <option value="6">토요일</option>
+              </select>
+              <input type="time" id="scheduleTimeWeekly" value="09:00" onchange="updateSchedule()">
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:20px;padding-top:20px;border-top:1px solid rgba(0,217,255,0.2);">
+          <button class="btn-primary" onclick="saveCurrentWorkflow()">💾 저장</button>
+          <button class="btn-success" onclick="testCurrentWorkflow()">▶ 테스트 실행</button>
+          <button class="btn-secondary" onclick="cancelEdit()">취소</button>
+        </div>
+      </div>
+
+      <!-- 워크플로우 실행 로그 -->
+      <div id="workflowRunLog" class="settings-section" style="display:none;">
+        <div style="display:flex;gap:20px;">
+          <!-- 왼쪽: 워크플로우 목록 -->
+          <div style="min-width:200px;border-right:1px solid rgba(0,217,255,0.2);padding-right:15px;">
+            <h4 style="color:#00d9ff;margin-bottom:10px;">📁 워크플로우</h4>
+            <div id="runLogWorkflowList"></div>
+            <button class="btn-secondary btn-sm" onclick="closeRunLog()" style="margin-top:15px;width:100%;">← 목록으로</button>
+          </div>
+          <!-- 오른쪽: 실행 로그 -->
+          <div style="flex:1;">
+            <h3 id="runLogTitle">📜 실행 로그</h3>
+            <div id="runLogContent" class="task-log" style="max-height:500px;"></div>
+            <div id="runLogResult" style="margin-top:15px;"></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 설정 탭 -->
@@ -918,10 +1334,23 @@ const HTML_PAGE = `<!DOCTYPE html>
         telegramSelect.appendChild(opt);
       });
 
+      // 워크플로우 프로필 선택기
+      const wfSelect = document.getElementById('wfProfile');
+      if (wfSelect) {
+        wfSelect.innerHTML = '';
+        profiles.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.path;
+          opt.textContent = p.displayName;
+          wfSelect.appendChild(opt);
+        });
+      }
+
       // 저장된 프로필 적용
       if (settings.browser?.selectedProfile) {
         browserSelect.value = settings.browser.selectedProfile;
         taskSelect.value = settings.browser.selectedProfile;
+        if (wfSelect) wfSelect.value = settings.browser.selectedProfile;
       }
       if (settings.telegram?.profile) {
         telegramSelect.value = settings.telegram.profile;
@@ -1341,6 +1770,394 @@ const HTML_PAGE = `<!DOCTYPE html>
       if (e.key === 'Enter') addTask();
     });
 
+    // ============ 워크플로우 관련 ============
+    let workflows = [];
+    let currentWorkflow = null;
+    let stepCounter = 0;
+
+    function loadWorkflowList() {
+      ws.send(JSON.stringify({ type: 'getWorkflows' }));
+    }
+
+    function renderWorkflows() {
+      const grid = document.getElementById('workflowsGrid');
+      const noWf = document.getElementById('noWorkflows');
+
+      if (workflows.length === 0) {
+        grid.innerHTML = '';
+        noWf.style.display = 'block';
+        return;
+      }
+
+      noWf.style.display = 'none';
+      grid.innerHTML = workflows.map(wf => \`
+        <div class="workflow-card \${wf.enabled ? '' : 'disabled'}">
+          <div class="workflow-header">
+            <span class="workflow-name">\${wf.enabled ? '●' : '○'} \${escapeHtml(wf.name)}</span>
+            <div class="workflow-actions">
+              <button class="btn-primary" onclick="runWorkflow('\${wf.id}')" title="실행">▶</button>
+              <button class="btn-secondary" onclick="editWorkflow('\${wf.id}')" title="편집">✏️</button>
+              <button class="btn-danger" onclick="deleteWorkflowConfirm('\${wf.id}')" title="삭제">🗑</button>
+            </div>
+          </div>
+          \${wf.description ? \`<div class="workflow-desc">\${escapeHtml(wf.description)}</div>\` : ''}
+          <div class="workflow-meta">
+            <span>📋 \${wf.steps?.length || 0}단계</span>
+            <span>📅 \${new Date(wf.updatedAt).toLocaleDateString('ko-KR')}</span>
+          </div>
+        </div>
+      \`).join('');
+    }
+
+    function createNewWorkflow() {
+      currentWorkflow = {
+        id: '',
+        name: '',
+        description: '',
+        enabled: true,
+        steps: []
+      };
+      stepCounter = 0;
+      showEditor();
+    }
+
+    function editWorkflow(id) {
+      const wf = workflows.find(w => w.id === id);
+      if (!wf) return;
+      currentWorkflow = JSON.parse(JSON.stringify(wf)); // Deep clone
+      stepCounter = currentWorkflow.steps.length;
+      showEditor();
+    }
+
+    function showEditor() {
+      document.getElementById('workflowList').style.display = 'none';
+      document.getElementById('workflowEditor').style.display = 'block';
+      document.getElementById('workflowRunLog').style.display = 'none';
+
+      document.getElementById('editorTitle').textContent = currentWorkflow.id ? '✏️ 워크플로우 편집' : '✨ 새 워크플로우';
+      document.getElementById('wfName').value = currentWorkflow.name || '';
+      document.getElementById('wfDescription').value = currentWorkflow.description || '';
+      document.getElementById('wfEnabled').checked = currentWorkflow.enabled !== false;
+
+      // 미션 로드
+      document.getElementById('wfMission').value = currentWorkflow.mission || '';
+      document.getElementById('wfMaxTurns').value = currentWorkflow.maxTurns || 30;
+
+      // 스케줄 설정 로드
+      const schedule = currentWorkflow.schedule || {};
+      document.getElementById('scheduleEnabled').checked = schedule.enabled || false;
+      document.getElementById('scheduleOptions').style.display = schedule.enabled ? 'block' : 'none';
+      document.getElementById('scheduleType').value = schedule.type || 'interval';
+      document.getElementById('intervalMinutes').value = schedule.intervalMinutes || 60;
+      document.getElementById('scheduleTime').value = schedule.time || '09:00';
+      document.getElementById('scheduleTimeWeekly').value = schedule.time || '09:00';
+      document.getElementById('scheduleDayOfWeek').value = schedule.dayOfWeek || 1;
+      updateScheduleType();
+
+      renderSteps();
+    }
+
+    function cancelEdit() {
+      currentWorkflow = null;
+      document.getElementById('workflowList').style.display = 'block';
+      document.getElementById('workflowEditor').style.display = 'none';
+    }
+
+    function updateSchedule() {
+      const enabled = document.getElementById('scheduleEnabled').checked;
+      document.getElementById('scheduleOptions').style.display = enabled ? 'block' : 'none';
+
+      if (!currentWorkflow.schedule) currentWorkflow.schedule = {};
+      currentWorkflow.schedule.enabled = enabled;
+      currentWorkflow.schedule.type = document.getElementById('scheduleType').value;
+      currentWorkflow.schedule.intervalMinutes = parseInt(document.getElementById('intervalMinutes').value) || 60;
+
+      const scheduleType = currentWorkflow.schedule.type;
+      if (scheduleType === 'daily') {
+        currentWorkflow.schedule.time = document.getElementById('scheduleTime').value;
+      } else if (scheduleType === 'weekly') {
+        currentWorkflow.schedule.time = document.getElementById('scheduleTimeWeekly').value;
+        currentWorkflow.schedule.dayOfWeek = parseInt(document.getElementById('scheduleDayOfWeek').value);
+      }
+    }
+
+    function updateScheduleType() {
+      const type = document.getElementById('scheduleType').value;
+      document.getElementById('intervalOptions').style.display = type === 'interval' ? 'flex' : 'none';
+      document.getElementById('dailyOptions').style.display = type === 'daily' ? 'flex' : 'none';
+      document.getElementById('weeklyOptions').style.display = type === 'weekly' ? 'flex' : 'none';
+      updateSchedule();
+    }
+
+    function renderSteps() {
+      const container = document.getElementById('stepsContainer');
+      if (!currentWorkflow.steps || currentWorkflow.steps.length === 0) {
+        container.innerHTML = '<div style="color:#666;padding:15px;text-align:center;">단계가 없습니다. 아래 버튼을 눌러 추가하세요.</div>';
+        return;
+      }
+
+      container.innerHTML = currentWorkflow.steps.map((step, idx) => {
+        const stepOptions = getStepOptions(idx);
+        const isFirst = idx === 0;
+        const isLast = idx === currentWorkflow.steps.length - 1;
+        return \`
+          <div class="step-card" data-step-idx="\${idx}">
+            <div class="step-controls">
+              <button class="step-move" onclick="moveStep(\${idx}, -1)" \${isFirst ? 'disabled' : ''} title="위로">▲</button>
+              <button class="step-move" onclick="moveStep(\${idx}, 1)" \${isLast ? 'disabled' : ''} title="아래로">▼</button>
+              <button class="step-delete" onclick="deleteStep(\${idx})" title="삭제">×</button>
+            </div>
+            <div class="step-header">
+              <span class="step-number">\${idx + 1}</span>
+              <input type="text" value="\${escapeHtml(step.name || '')}" placeholder="단계 이름"
+                     onchange="updateStep(\${idx}, 'name', this.value)" style="flex:1;margin-left:10px;font-weight:bold;" />
+            </div>
+
+            <div class="prompt-container">
+              <textarea class="prompt-input" placeholder="AI에게 시킬 작업을 자연어로 작성하세요.
+
+예시:
+• https://naver.com 에 접속해
+• 검색창에 '오늘 날씨'를 입력하고 검색 버튼을 클릭해
+• 로그인 버튼을 찾아서 클릭해
+• 페이지에서 가격 정보를 찾아서 알려줘
+• 스크롤을 내려서 더보기 버튼을 클릭해"
+                        onchange="updateStep(\${idx}, 'prompt', this.value)">\${escapeHtml(step.prompt || '')}</textarea>
+            </div>
+
+            <details class="advanced-options">
+              <summary>고급 옵션</summary>
+              <div class="step-row">
+                <label>성공 시</label>
+                <select onchange="updateStep(\${idx}, 'onSuccess', this.value)">
+                  <option value="next" \${step.onSuccess === 'next' ? 'selected' : ''}>다음 단계로</option>
+                  <option value="end" \${step.onSuccess === 'end' ? 'selected' : ''}>워크플로우 종료</option>
+                  \${stepOptions}
+                </select>
+              </div>
+              <div class="step-row">
+                <label>실패 시</label>
+                <select onchange="updateStep(\${idx}, 'onFailure', this.value)">
+                  <option value="end" \${step.onFailure === 'end' ? 'selected' : ''}>워크플로우 종료</option>
+                  <option value="retry" \${step.onFailure === 'retry' ? 'selected' : ''}>재시도</option>
+                  <option value="next" \${step.onFailure === 'next' ? 'selected' : ''}>다음 단계로</option>
+                  \${stepOptions}
+                </select>
+                \${step.onFailure === 'retry' ? \`
+                  <input type="number" value="\${step.retryCount || 2}" min="1" max="5" style="width:50px;margin-left:5px;"
+                         onchange="updateStep(\${idx}, 'retryCount', parseInt(this.value))" title="재시도 횟수" />회
+                \` : ''}
+              </div>
+            </details>
+          </div>
+        \`;
+      }).join('');
+    }
+
+    function getStepOptions(currentIdx) {
+      return currentWorkflow.steps.map((s, i) => {
+        if (i === currentIdx) return '';
+        const selected = currentWorkflow.steps[currentIdx]?.onSuccess === s.id ||
+                        currentWorkflow.steps[currentIdx]?.onFailure === s.id ? 'selected' : '';
+        return \`<option value="\${s.id}" \${selected}>→ \${i + 1}. \${escapeHtml(s.name || '(이름없음)')}</option>\`;
+      }).join('');
+    }
+
+    function addStep() {
+      if (!currentWorkflow.steps) currentWorkflow.steps = [];
+      const newStep = {
+        id: 'step-' + Date.now() + '-' + (++stepCounter),
+        name: '단계 ' + (currentWorkflow.steps.length + 1),
+        prompt: '',
+        onSuccess: 'next',
+        onFailure: 'end'
+      };
+      currentWorkflow.steps.push(newStep);
+      renderSteps();
+    }
+
+    function deleteStep(idx) {
+      if (confirm('이 단계를 삭제하시겠습니까?')) {
+        currentWorkflow.steps.splice(idx, 1);
+        renderSteps();
+      }
+    }
+
+    function moveStep(idx, direction) {
+      const newIdx = idx + direction;
+      if (newIdx < 0 || newIdx >= currentWorkflow.steps.length) return;
+      const temp = currentWorkflow.steps[idx];
+      currentWorkflow.steps[idx] = currentWorkflow.steps[newIdx];
+      currentWorkflow.steps[newIdx] = temp;
+      renderSteps();
+    }
+
+    function updateStep(idx, field, value) {
+      currentWorkflow.steps[idx][field] = value;
+    }
+
+    function saveCurrentWorkflow() {
+      const name = document.getElementById('wfName').value.trim();
+      if (!name) {
+        showWorkflowAlert(false, '이름을 입력하세요.');
+        return;
+      }
+
+      currentWorkflow.name = name;
+      currentWorkflow.description = document.getElementById('wfDescription').value.trim();
+      currentWorkflow.enabled = document.getElementById('wfEnabled').checked;
+      currentWorkflow.mission = document.getElementById('wfMission').value.trim();
+      currentWorkflow.maxTurns = parseInt(document.getElementById('wfMaxTurns').value) || 30;
+
+      ws.send(JSON.stringify({
+        type: 'saveWorkflow',
+        workflow: currentWorkflow
+      }));
+    }
+
+    function testCurrentWorkflow() {
+      const mission = document.getElementById('wfMission').value.trim();
+      const hasSteps = currentWorkflow && currentWorkflow.steps && currentWorkflow.steps.length > 0;
+
+      if (!mission && !hasSteps) {
+        showWorkflowAlert(false, '미션 또는 단계를 입력하세요.');
+        return;
+      }
+
+      // 먼저 저장
+      const name = document.getElementById('wfName').value.trim();
+      if (!name) {
+        showWorkflowAlert(false, '이름을 입력하고 저장 후 실행하세요.');
+        return;
+      }
+
+      currentWorkflow.name = name;
+      currentWorkflow.description = document.getElementById('wfDescription').value.trim();
+      currentWorkflow.enabled = document.getElementById('wfEnabled').checked;
+      currentWorkflow.mission = mission;
+      currentWorkflow.maxTurns = parseInt(document.getElementById('wfMaxTurns').value) || 30;
+
+      // 저장 후 실행
+      ws.send(JSON.stringify({
+        type: 'saveWorkflow',
+        workflow: currentWorkflow,
+        runAfterSave: true
+      }));
+    }
+
+    let runningWorkflowId = null;
+
+    function runWorkflow(id) {
+      const profileSelect = document.getElementById('wfProfile');
+      const profile = profileSelect ? profileSelect.value : '';
+
+      runningWorkflowId = id;
+      const wf = workflows.find(w => w.id === id);
+
+      document.getElementById('workflowList').style.display = 'none';
+      document.getElementById('workflowEditor').style.display = 'none';
+      document.getElementById('workflowRunLog').style.display = 'block';
+      document.getElementById('runLogTitle').textContent = '📜 ' + (wf?.name || '실행 로그');
+      document.getElementById('runLogContent').innerHTML = '워크플로우 실행 중...\\n';
+      document.getElementById('runLogResult').innerHTML = '';
+
+      // 왼쪽 워크플로우 목록 업데이트
+      updateRunLogWorkflowList();
+
+      ws.send(JSON.stringify({ type: 'runWorkflow', workflowId: id, profile: profile }));
+    }
+
+    function updateRunLogWorkflowList() {
+      const container = document.getElementById('runLogWorkflowList');
+      if (!container) return;
+
+      container.innerHTML = workflows.map(wf => {
+        const isRunning = wf.id === runningWorkflowId;
+        return \`
+          <div class="run-log-wf-item \${isRunning ? 'active' : ''}" onclick="\${isRunning ? '' : 'runWorkflow(\\'' + wf.id + '\\')'}">
+            <span class="run-log-wf-status">\${isRunning ? '🔄' : '▶'}</span>
+            <span class="run-log-wf-name">\${escapeHtml(wf.name)}</span>
+          </div>
+        \`;
+      }).join('');
+    }
+
+    function closeRunLog() {
+      runningWorkflowId = null;
+      document.getElementById('workflowRunLog').style.display = 'none';
+      document.getElementById('workflowList').style.display = 'block';
+    }
+
+    function deleteWorkflowConfirm(id) {
+      if (confirm('이 워크플로우를 삭제하시겠습니까?')) {
+        ws.send(JSON.stringify({ type: 'deleteWorkflow', workflowId: id }));
+      }
+    }
+
+    function showWorkflowAlert(success, message) {
+      const el = document.getElementById('workflowAlert');
+      el.innerHTML = \`<div class="alert \${success ? 'alert-success' : 'alert-error'}">\${message}</div>\`;
+      setTimeout(() => el.innerHTML = '', 5000);
+    }
+
+    // 워크플로우 메시지 핸들러 확장
+    const origHandleMessage = handleMessage;
+    handleMessage = function(msg) {
+      if (msg.type === 'workflows') {
+        workflows = msg.workflows || [];
+        renderWorkflows();
+        return;
+      }
+      if (msg.type === 'workflowSaved') {
+        showWorkflowAlert(true, '워크플로우가 저장되었습니다.');
+        if (msg.workflow) {
+          currentWorkflow = msg.workflow;
+        }
+        loadWorkflowList();
+        if (msg.runAfterSave && currentWorkflow?.id) {
+          runWorkflow(currentWorkflow.id);
+        }
+        return;
+      }
+      if (msg.type === 'workflowDeleted') {
+        showWorkflowAlert(true, '워크플로우가 삭제되었습니다.');
+        loadWorkflowList();
+        return;
+      }
+      if (msg.type === 'workflowLog') {
+        const logEl = document.getElementById('runLogContent');
+        const typeClass = msg.logType === 'error' ? 'log-error' : msg.logType === 'success' ? 'log-success' : '';
+        logEl.innerHTML += \`<span class="\${typeClass}">[\${msg.stepName || 'workflow'}] \${escapeHtml(msg.message)}</span>\\n\`;
+        logEl.scrollTop = logEl.scrollHeight;
+        return;
+      }
+      if (msg.type === 'workflowResult') {
+        runningWorkflowId = null;
+        updateRunLogWorkflowList();
+        const resultEl = document.getElementById('runLogResult');
+        if (msg.success) {
+          resultEl.innerHTML = \`<div class="task-result">✅ 완료! \${msg.stepsExecuted}단계 실행 (\${((msg.endTime - msg.startTime) / 1000).toFixed(1)}초)</div>\`;
+        } else {
+          resultEl.innerHTML = \`<div class="task-result" style="background:rgba(231,76,60,0.1);border-color:rgba(231,76,60,0.3);color:#e74c3c;">❌ 실패: \${escapeHtml(msg.error || '알 수 없는 오류')}</div>\`;
+        }
+        return;
+      }
+      if (msg.type === 'workflowError') {
+        showWorkflowAlert(false, msg.message);
+        return;
+      }
+      origHandleMessage(msg);
+    };
+
+    // 탭 변경 시 워크플로우 로드
+    const origShowTab = showTab;
+    showTab = function(tabId) {
+      origShowTab(tabId);
+      if (tabId === 'workflows') {
+        loadWorkflowList();
+      }
+    };
+
     connect();
   </script>
 </body>
@@ -1354,6 +2171,7 @@ export interface WebClientConfig {
   onSettingsChange?: (settings: Settings) => void;
   getProfiles?: () => ChromeProfile[];
   isExtensionConnected?: () => boolean;
+  onWorkflowRun?: (workflow: Workflow, send: (msg: any) => void, profile?: string) => Promise<void>;
 }
 
 // 중지된 작업 추적
@@ -1701,6 +2519,72 @@ export function startWebClient(config: WebClientConfig): Promise<{ settings: Set
               await onTask(taskId, mission, send, profile);
             } catch (error) {
               send({ type: "error", text: (error as Error).message });
+            }
+          }
+
+          // ============ 워크플로우 핸들러 ============
+          else if (msg.type === "getWorkflows") {
+            const workflows = loadWorkflows();
+            ws.send(JSON.stringify({ type: "workflows", workflows }));
+          }
+
+          else if (msg.type === "saveWorkflow") {
+            const wfData = msg.workflow as Workflow;
+            if (!wfData.id) {
+              wfData.id = generateWorkflowId();
+              wfData.createdAt = Date.now();
+            }
+            wfData.updatedAt = Date.now();
+            saveWorkflow(wfData);
+            ws.send(JSON.stringify({
+              type: "workflowSaved",
+              workflow: wfData,
+              runAfterSave: msg.runAfterSave
+            }));
+          }
+
+          else if (msg.type === "deleteWorkflow") {
+            const { workflowId } = msg;
+            const deleted = deleteWorkflow(workflowId);
+            if (deleted) {
+              ws.send(JSON.stringify({ type: "workflowDeleted", workflowId }));
+            } else {
+              ws.send(JSON.stringify({ type: "workflowError", message: "워크플로우를 삭제할 수 없습니다." }));
+            }
+          }
+
+          else if (msg.type === "runWorkflow") {
+            const { workflowId, profile } = msg;
+            const workflow = loadWorkflow(workflowId);
+
+            if (!workflow) {
+              ws.send(JSON.stringify({ type: "workflowError", message: "워크플로우를 찾을 수 없습니다." }));
+              return;
+            }
+
+            console.log(`[WebClient] 워크플로우 실행: ${workflow.name} (${workflowId}) 프로필: ${profile || '기본'}`);
+
+            const send = (m: any) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(m));
+              }
+            };
+
+            if (config.onWorkflowRun) {
+              try {
+                await config.onWorkflowRun(workflow, send, profile);
+              } catch (error) {
+                send({
+                  type: "workflowResult",
+                  success: false,
+                  error: (error as Error).message,
+                  stepsExecuted: 0,
+                  startTime: Date.now(),
+                  endTime: Date.now()
+                });
+              }
+            } else {
+              send({ type: "workflowError", message: "워크플로우 실행 기능이 설정되지 않았습니다." });
             }
           }
         } catch (e) {

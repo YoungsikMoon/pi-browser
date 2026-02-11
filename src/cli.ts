@@ -8,14 +8,6 @@
 
 import "dotenv/config";
 
-// API 키 호환성: GOOGLE_API_KEY와 GEMINI_API_KEY 모두 지원
-if (process.env.GOOGLE_API_KEY && !process.env.GEMINI_API_KEY) {
-  process.env.GEMINI_API_KEY = process.env.GOOGLE_API_KEY;
-}
-if (process.env.GEMINI_API_KEY && !process.env.GOOGLE_API_KEY) {
-  process.env.GOOGLE_API_KEY = process.env.GEMINI_API_KEY;
-}
-
 import readline from "node:readline";
 import { chromium, type Browser, type Page, type BrowserContext } from "playwright-core";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -25,6 +17,19 @@ import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { startTelegramBot, stopTelegramBot, type MessageContext } from "./telegram.js";
 import { startWebClient, stoppedTasks, loadSettings, broadcastToClients, saveResultToNotion } from "./web-client.js";
+import {
+  buildNaverBlogWriteMission,
+  loadNaverBlogPostOptionsFromJson,
+} from "./naver-blog.js";
+import {
+  loadWorkflows,
+  loadWorkflow,
+  saveWorkflow,
+  WorkflowExecutor,
+  startScheduler,
+  type Workflow,
+  type WorkflowLog,
+} from "./workflow/index.js";
 
 import { Type } from "@sinclair/typebox";
 import {
@@ -1022,6 +1027,14 @@ const browserTools: Tool[] = [
     }),
   },
   {
+    name: "browser_upload",
+    description: "Upload local files via file input or file chooser",
+    parameters: Type.Object({
+      selector: Type.String({ description: "File input selector OR upload button selector" }),
+      filePaths: Type.Array(Type.String({ description: "Absolute or relative file path" })),
+    }),
+  },
+  {
     name: "get_current_time",
     description: "Get the current date and time",
     parameters: Type.Object({}),
@@ -1108,6 +1121,12 @@ async function executeExtensionTool(
         return { text: `Waited ${timeMs}ms` };
       }
       return { text: "Waited" };
+    }
+
+    case "browser_upload": {
+      return {
+        text: "File upload is not supported in extension mode. Use CDP mode (default) with a Chrome profile.",
+      };
     }
 
     case "get_current_time": {
@@ -1318,6 +1337,55 @@ async function executeBrowserTool(
       return { text: `Downloaded: ${savePath} (${suggestedName})` };
     }
 
+    case "browser_upload": {
+      const selector = args.selector as string;
+      const raw = (args.filePaths as unknown) ?? [];
+      const filePaths: string[] = Array.isArray(raw)
+        ? (raw as unknown[]).map(String)
+        : typeof raw === "string"
+          ? raw.split(",").map((s) => s.trim()).filter(Boolean)
+          : [];
+
+      if (!selector || filePaths.length === 0) {
+        throw new Error("browser_upload requires selector and filePaths[]");
+      }
+
+      const resolved = filePaths.map((p) => (path.isAbsolute(p) ? p : path.resolve(process.cwd(), p)));
+      const missing = resolved.filter((p) => !fs.existsSync(p));
+      if (missing.length > 0) {
+        throw new Error(`File not found: ${missing.join(", ")}`);
+      }
+
+      const loc = page.locator(selector).first();
+
+      // Strategy 1: input[type=file]
+      try {
+        const isFileInput = await loc.evaluate((el) => {
+          const tag = String((el as any).tagName || "").toLowerCase();
+          if (tag !== "input") return false;
+          const type = (el as any).type;
+          return String(type).toLowerCase() === "file";
+        });
+
+        if (isFileInput) {
+          await loc.setInputFiles(resolved);
+          await page.waitForTimeout(1000);
+          return { text: `Uploaded ${resolved.length} file(s) via input: ${selector}` };
+        }
+      } catch {
+        // fall through to chooser strategy
+      }
+
+      // Strategy 2: click to open file chooser
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 10000 }),
+        loc.click(),
+      ]);
+      await chooser.setFiles(resolved);
+      await page.waitForTimeout(1000);
+      return { text: `Uploaded ${resolved.length} file(s) via chooser: ${selector}` };
+    }
+
     case "get_current_time": {
       const now = new Date();
       const dateStr = now.toLocaleDateString("ko-KR", {
@@ -1428,6 +1496,7 @@ TOOLS:
 - browser_wait: {"text": "Complete"} - Wait for text to appear
 - browser_wait: {"textGone": "Loading..."} - Wait for text to disappear
 - browser_download: {"selector": "...", "filename": "file.mp3"} - Download file
+- browser_upload: {"selector": "...", "filePaths": ["/abs/path/a.png"]} - Upload local file(s)
 
 WORKFLOW: navigate → snapshot → interact → get_text → report
 SELECTOR FORMAT: role:"name" (e.g., textbox:"Search", button:"Submit")
@@ -1562,8 +1631,9 @@ ${c.bright}명령어${c.reset} ${c.dim}(슬래시 없이도 됨)${c.reset}
 
 ${c.yellow}e${c.reset}               로그인 모드 (내 Chrome 계정 사용)
 ${c.yellow}tg${c.reset}              텔레그램 봇 모드 (TELEGRAM_BOT_TOKEN 필요)
-${c.yellow}web${c.reset}             웹 UI 모드 (http://localhost:3456)
-${c.yellow}p N${c.reset}             병렬 실행 (브라우저 N개, 작업 하나씩 입력)
+ ${c.yellow}web${c.reset}             웹 UI 모드 (http://localhost:3456)
+ ${c.yellow}naver-blog <json>${c.reset}  네이버 블로그 글쓰기 (Playwright/CDP, JSON 파일)
+ ${c.yellow}p N${c.reset}             병렬 실행 (브라우저 N개, 작업 하나씩 입력)
                 예: p 3 → 작업 입력 → 빈 줄로 실행
 ${c.yellow}profiles${c.reset}        Chrome 프로필 목록
 ${c.yellow}models${c.reset}          AI 모델 목록
@@ -1626,6 +1696,182 @@ async function runWebMode(config: Config, overridePort?: number): Promise<void> 
     },
     isExtensionConnected: () => {
       return extClient !== null && extClient.readyState === 1; // WebSocket.OPEN = 1
+    },
+    onWorkflowRun: async (workflow, send, profilePath) => {
+      console.log(`[WebClient] 워크플로우 실행: ${workflow.name} (프로필: ${profilePath || '기본'})`);
+
+      // 설정에서 AI 확인
+      const currentSettings = loadSettings();
+
+      // AI 모델 설정
+      let taskModel = model;
+      let taskIsOllama = isOllama;
+      if (currentSettings.ai?.provider) {
+        const aiProvider = currentSettings.ai.provider;
+        const aiModelName = currentSettings.ai.model || "gemini-2.0-flash";
+        let aiOllamaUrl = currentSettings.ai.ollamaUrl || "http://localhost:11434";
+        if (!aiOllamaUrl.endsWith("/v1")) {
+          aiOllamaUrl = aiOllamaUrl.replace(/\/$/, "") + "/v1";
+        }
+        taskIsOllama = aiProvider === "ollama";
+
+        try {
+          if (taskIsOllama) {
+            taskModel = createOllamaModel(aiModelName, aiOllamaUrl);
+          } else {
+            const fetchedModel = getModel(aiProvider as any, aiModelName as any);
+            if (fetchedModel) taskModel = fetchedModel;
+          }
+        } catch (e) {
+          // 기본 모델 사용
+        }
+      }
+
+      // 워크플로우는 항상 CDP 모드로 실행
+      browserMode = "cdp";
+      const profiles = scanChromeProfiles();
+      const newProfile = profilePath ? profiles.find(p => p.path === profilePath) : null;
+
+      // 프로필이 변경되면 브라우저 재시작
+      if (browser && newProfile && selectedProfile?.path !== newProfile.path) {
+        send({ type: "workflowLog", stepName: "system", logType: "info", message: `프로필 변경: ${newProfile.displayName}` });
+        await stopBrowser();
+      }
+
+      if (!browser) {
+        if (newProfile) {
+          selectedProfile = newProfile;
+          send({ type: "workflowLog", stepName: "system", logType: "info", message: `프로필: ${newProfile.displayName}` });
+        }
+        send({ type: "workflowLog", stepName: "system", logType: "info", message: "브라우저 시작 중..." });
+        await startBrowser();
+        send({ type: "workflowLog", stepName: "system", logType: "success", message: "브라우저 준비 완료" });
+      }
+
+      const page = await getPage();
+
+      // AI 에이전트로 단계 실행하는 함수
+      const runStepAgent = async (
+        prompt: string,
+        maxTurns: number,
+        onLog: (text: string) => void
+      ): Promise<{ success: boolean; result: string }> => {
+        const ctx: Context = {
+          systemPrompt: `You are a browser automation agent. You MUST complete tasks using browser tools.
+
+STRICT WORKFLOW - FOLLOW EXACTLY:
+1. browser_navigate to the URL
+2. browser_snapshot - READ THE OUTPUT CAREFULLY!
+3. FIND the element you need from snapshot output (look for links, buttons, text)
+4. browser_click using the EXACT selector from snapshot
+5. browser_snapshot again to see result
+6. Repeat until done, then report findings in Korean
+
+SNAPSHOT ANALYSIS:
+- Snapshot shows: [ref=X] ElementType "text" or [ref=X] link "text" [url]
+- Use ref=X as selector: {"selector": "[ref=X]"}
+- Or use text: {"selector": "text=주문"} for partial match
+- READ snapshot output! Don't guess!
+
+TOOLS:
+- browser_navigate: {"url": "..."} - Go to URL
+- browser_snapshot: {} - Get page elements (MUST DO FIRST!)
+- browser_click: {"selector": "[ref=X]"} - Click (use ref from snapshot)
+- browser_fill: {"selector": "...", "text": "..."} - Type text
+- browser_get_text: {"selector": ""} - Get all text from page
+
+NEVER refuse. NEVER apologize. Just DO IT.
+결과는 한국어로 보고하세요.`,
+          messages: [{ role: "user", content: prompt }],
+          tools: browserTools,
+        };
+
+        let lastResult = "";
+
+        for (let turn = 0; turn < maxTurns; turn++) {
+          try {
+            const streamOptions = taskIsOllama ? { apiKey: "ollama" } : undefined;
+            const s = streamSimple(taskModel, ctx, streamOptions);
+            for await (const _ of s) {}
+            const response = await s.result();
+            ctx.messages.push(response);
+
+            const toolCalls = response.content.filter((b) => b.type === "toolCall");
+
+            // 도구 호출이 없으면 완료
+            if (toolCalls.length === 0) {
+              const textBlocks = response.content.filter((b) => b.type === "text");
+              lastResult = textBlocks.map((b) => (b as any).text).join("\n");
+              return { success: true, result: lastResult || "완료" };
+            }
+
+            // 도구 실행
+            for (const call of toolCalls) {
+              const toolCall = call as any;
+              onLog(`[TOOL] ${toolCall.name}(${JSON.stringify(toolCall.arguments)})`);
+
+              try {
+                const toolResult = await executeBrowserTool(toolCall.name, toolCall.arguments || {});
+                onLog(`[OK] ${toolResult.text.slice(0, 100)}`);
+                ctx.messages.push({
+                  role: "toolResult",
+                  toolCallId: toolCall.id,
+                  toolName: toolCall.name,
+                  content: [{ type: "text", text: toolResult.text }],
+                  isError: false,
+                  timestamp: Date.now(),
+                } as any);
+              } catch (err) {
+                const errMsg = (err as Error).message;
+                onLog(`[ERROR] ${errMsg}`);
+                ctx.messages.push({
+                  role: "toolResult",
+                  toolCallId: toolCall.id,
+                  toolName: toolCall.name,
+                  content: [{ type: "text", text: `Error: ${errMsg}` }],
+                  isError: true,
+                  timestamp: Date.now(),
+                } as any);
+              }
+            }
+          } catch (error) {
+            return { success: false, result: (error as Error).message };
+          }
+        }
+
+        return { success: true, result: lastResult || "최대 턴 도달" };
+      };
+
+      // 워크플로우 실행
+      const executor = new WorkflowExecutor(
+        workflow,
+        {
+          page,
+          runStepAgent,
+        },
+        (log: WorkflowLog) => {
+          send({
+            type: "workflowLog",
+            stepId: log.stepId,
+            stepName: log.stepName,
+            logType: log.type,
+            message: log.message
+          });
+        }
+      );
+
+      const result = await executor.execute();
+
+      send({
+        type: "workflowResult",
+        success: result.success,
+        workflowId: result.workflowId,
+        startTime: result.startTime,
+        endTime: result.endTime,
+        stepsExecuted: result.stepsExecuted,
+        lastStepId: result.lastStepId,
+        error: result.error
+      });
     },
     onTask: async (taskId, mission, send, taskProfile) => {
       send({ type: "log", text: `[START] ${mission}` });
@@ -1727,25 +1973,32 @@ async function runWebMode(config: Config, overridePort?: number): Promise<void> 
       }
 
       const ctx: Context = {
-        systemPrompt: `You are a browser automation agent with FULL browser access.
+        systemPrompt: `You are a browser automation agent. You MUST complete tasks using browser tools.
 
-CRITICAL RULES:
-1. NEVER say "I can't" or "I'm sorry" - just DO IT using the browser!
-2. You have access to a REAL browser with logged-in sessions. Just navigate and use it!
-3. Start with browser_navigate, then browser_snapshot to see the page.
-4. The browser has the user's cookies/logins. Just go to the website!
+STRICT WORKFLOW - FOLLOW EXACTLY:
+1. browser_navigate to the URL
+2. browser_snapshot - READ THE OUTPUT CAREFULLY!
+3. FIND the element you need from snapshot output (look for links, buttons, text)
+4. browser_click using the EXACT selector from snapshot
+5. browser_snapshot again to see result
+6. Repeat until done, then report findings in Korean
+
+SNAPSHOT ANALYSIS:
+- Snapshot shows: [ref=X] ElementType "text" or [ref=X] link "text" [url]
+- Use ref=X as selector: {"selector": "[ref=X]"}
+- Or use text: {"selector": "text=주문"} for partial match
+- READ snapshot output! Don't guess!
 
 TOOLS:
 - get_current_time: {} - Get current date/time
-- browser_navigate: {"url": "..."} - Go to any URL directly
-- browser_snapshot: {} - See page elements (ALWAYS do this after navigate!)
+- browser_navigate: {"url": "..."} - Go to URL
+- browser_snapshot: {} - Get page elements (MUST DO FIRST!)
+- browser_click: {"selector": "[ref=X]"} - Click (use ref from snapshot)
 - browser_fill: {"selector": "...", "text": "..."} - Type text
-- browser_click: {"selector": "..."} - Click element
-- browser_press: {"key": "Enter"} - Press key
-- browser_get_text: {"selector": ""} - Get page text
+- browser_get_text: {"selector": ""} - Get all text from page
 
-WORKFLOW: navigate → snapshot → interact → get_text → report result in Korean.
-DO NOT refuse. DO NOT apologize. Just USE THE BROWSER.`,
+NEVER refuse. NEVER apologize. Just DO IT.
+결과는 한국어로 보고하세요.`,
         messages: [{ role: "user", content: mission }],
         tools: browserTools,
       };
@@ -1843,6 +2096,91 @@ DO NOT refuse. DO NOT apologize. Just USE THE BROWSER.`,
   });
 
   console.log(`${c.green}✓ 웹 서버가 실행 중입니다. Ctrl+C로 종료.${c.reset}\n`);
+
+  // 워크플로우 스케줄러 시작
+  startScheduler({
+    onLog: (msg) => console.log(msg),
+    onWorkflowRun: async (workflow) => {
+      console.log(`[Scheduler] 스케줄 실행: ${workflow.name}`);
+
+      // CDP 모드로 브라우저 시작
+      browserMode = "cdp";
+      const currentSettings = loadSettings();
+      const profilePath = currentSettings.browser?.selectedProfile;
+      const profiles = scanChromeProfiles();
+      const profile = profilePath ? profiles.find(p => p.path === profilePath) : null;
+
+      if (!browser) {
+        if (profile) selectedProfile = profile;
+        await startBrowser();
+      }
+
+      const page = await getPage();
+
+      // AI 모델 설정
+      let taskModel = model;
+      let taskIsOllama = isOllama;
+      if (currentSettings.ai?.provider) {
+        const aiProvider = currentSettings.ai.provider;
+        const aiModelName = currentSettings.ai.model || "gemini-2.0-flash";
+        let aiOllamaUrl = currentSettings.ai.ollamaUrl || "http://localhost:11434";
+        if (!aiOllamaUrl.endsWith("/v1")) aiOllamaUrl = aiOllamaUrl.replace(/\/$/, "") + "/v1";
+        taskIsOllama = aiProvider === "ollama";
+        try {
+          if (taskIsOllama) {
+            taskModel = createOllamaModel(aiModelName, aiOllamaUrl);
+          } else {
+            const fetchedModel = getModel(aiProvider as any, aiModelName as any);
+            if (fetchedModel) taskModel = fetchedModel;
+          }
+        } catch (e) { /* 기본 모델 사용 */ }
+      }
+
+      const runStepAgent = async (prompt: string, maxTurns: number, onLog: (t: string) => void) => {
+        const ctx: Context = {
+          systemPrompt: `You are a browser automation agent. Complete the task fully using browser tools.
+TOOLS: browser_navigate, browser_snapshot, browser_fill, browser_click, browser_press, browser_get_text, browser_scroll, browser_wait
+After completing, respond with "완료: [summary]".`,
+          messages: [{ role: "user", content: prompt }],
+          tools: browserTools,
+        };
+        let lastResult = "";
+        for (let turn = 0; turn < maxTurns; turn++) {
+          try {
+            const s = streamSimple(taskModel, ctx, taskIsOllama ? { apiKey: "ollama" } : undefined);
+            for await (const _ of s) {}
+            const response = await s.result();
+            ctx.messages.push(response);
+            const toolCalls = response.content.filter((b) => b.type === "toolCall");
+            if (toolCalls.length === 0) {
+              const textBlocks = response.content.filter((b) => b.type === "text");
+              lastResult = textBlocks.map((b) => (b as any).text).join("\n");
+              return { success: true, result: lastResult || "완료" };
+            }
+            for (const call of toolCalls) {
+              const toolCall = call as any;
+              onLog(`[TOOL] ${toolCall.name}`);
+              try {
+                const toolResult = await executeBrowserTool(toolCall.name, toolCall.arguments || {});
+                ctx.messages.push({ role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text: toolResult.text }], isError: false, timestamp: Date.now() } as any);
+              } catch (err) {
+                ctx.messages.push({ role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true, timestamp: Date.now() } as any);
+              }
+            }
+          } catch (error) { return { success: false, result: (error as Error).message }; }
+        }
+        return { success: true, result: lastResult || "완료" };
+      };
+
+      const executor = new WorkflowExecutor(workflow, { page, runStepAgent }, (log) => {
+        console.log(`[${log.stepName}] ${log.message}`);
+        broadcastToClients({ type: "workflowLog", stepId: log.stepId, stepName: log.stepName, logType: log.type, message: log.message });
+      });
+
+      const result = await executor.execute();
+      broadcastToClients({ type: "workflowResult", success: result.success, stepsExecuted: result.stepsExecuted, error: result.error, startTime: result.startTime, endTime: result.endTime });
+    }
+  });
 
   // 브라우저 자동 열기
   const url = `http://localhost:${port}`;
@@ -2227,6 +2565,161 @@ async function main() {
       const profileName = arg.slice(8).trim();
       await importProfileData(profileName);
       continue;
+    }
+
+    // /wf - 워크플로우 목록 및 실행
+    if (arg === "/wf" || arg === "/workflow") {
+      const workflows = loadWorkflows();
+      if (workflows.length === 0) {
+        console.log(`${c.yellow}저장된 워크플로우가 없습니다.${c.reset}`);
+        console.log(`${c.dim}웹 UI에서 워크플로우를 만들어보세요: /web${c.reset}\n`);
+      } else {
+        console.log(`\n${c.cyan}저장된 워크플로우:${c.reset}\n`);
+        workflows.forEach((wf, idx) => {
+          const status = wf.enabled ? `${c.green}●${c.reset}` : `${c.dim}○${c.reset}`;
+          console.log(`  ${status} ${c.bright}${wf.name}${c.reset} ${c.dim}(${wf.id})${c.reset}`);
+          if (wf.description) {
+            console.log(`    ${c.dim}${wf.description}${c.reset}`);
+          }
+          console.log(`    ${c.dim}${wf.steps.length}단계 | ${new Date(wf.updatedAt).toLocaleDateString('ko-KR')}${c.reset}`);
+        });
+        console.log(`\n${c.dim}실행: /wf run <id>${c.reset}\n`);
+      }
+      process.exit(0);
+    }
+
+    // /wf run <id> - 워크플로우 실행
+    if (arg.startsWith("/wf run ") || arg.startsWith("/workflow run ")) {
+      const wfId = arg.replace(/^\/(wf|workflow) run /, "").trim();
+      const workflow = loadWorkflow(wfId);
+
+      if (!workflow) {
+        console.log(`${c.red}워크플로우를 찾을 수 없습니다: ${wfId}${c.reset}`);
+        console.log(`${c.dim}/wf 명령으로 목록을 확인하세요.${c.reset}\n`);
+        process.exit(1);
+      }
+
+      console.log(`\n${c.cyan}워크플로우 실행: ${workflow.name}${c.reset}`);
+      console.log(`${c.dim}${workflow.steps.length}개 단계${c.reset}\n`);
+
+      try {
+        // 브라우저 시작
+        await startBrowser();
+        const page = await getPage();
+        const wfModel = resolveModel(config);
+        const wfIsOllama = config.provider === "ollama";
+
+        // AI 에이전트로 단계 실행하는 함수
+        const runStepAgent = async (
+          prompt: string,
+          maxTurns: number,
+          onLog: (text: string) => void
+        ): Promise<{ success: boolean; result: string }> => {
+          const ctx: Context = {
+            systemPrompt: `You are a browser automation agent. Complete the user's task using browser tools.
+TOOLS: browser_navigate, browser_snapshot, browser_fill, browser_click, browser_press, browser_get_text
+After completing, respond with a brief summary. If you cannot complete, explain why.`,
+            messages: [{ role: "user", content: prompt }],
+            tools: browserTools,
+          };
+
+          let lastResult = "";
+          for (let turn = 0; turn < maxTurns; turn++) {
+            try {
+              const streamOptions = wfIsOllama ? { apiKey: "ollama" } : undefined;
+              const s = streamSimple(wfModel, ctx, streamOptions);
+              for await (const _ of s) {}
+              const response = await s.result();
+              ctx.messages.push(response);
+
+              const toolCalls = response.content.filter((b) => b.type === "toolCall");
+              if (toolCalls.length === 0) {
+                const textBlocks = response.content.filter((b) => b.type === "text");
+                lastResult = textBlocks.map((b) => (b as any).text).join("\n");
+                return { success: true, result: lastResult || "완료" };
+              }
+
+              for (const call of toolCalls) {
+                const toolCall = call as any;
+                onLog(`[TOOL] ${toolCall.name}`);
+                try {
+                  const toolResult = await executeBrowserTool(toolCall.name, toolCall.arguments || {});
+                  ctx.messages.push({
+                    role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name,
+                    content: [{ type: "text", text: toolResult.text }], isError: false, timestamp: Date.now(),
+                  } as any);
+                } catch (err) {
+                  ctx.messages.push({
+                    role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name,
+                    content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true, timestamp: Date.now(),
+                  } as any);
+                }
+              }
+            } catch (error) {
+              return { success: false, result: (error as Error).message };
+            }
+          }
+          return { success: true, result: lastResult || "완료" };
+        };
+
+        // 워크플로우 실행
+        const executor = new WorkflowExecutor(
+          workflow,
+          { page, runStepAgent },
+          (log: WorkflowLog) => {
+            const prefix = log.type === "error" ? c.red :
+                          log.type === "success" ? c.green :
+                          log.type === "condition" ? c.yellow : c.dim;
+            console.log(`${prefix}[${log.stepName}] ${log.message}${c.reset}`);
+          }
+        );
+
+        const result = await executor.execute();
+
+        if (result.success) {
+          console.log(`\n${c.green}✅ 완료! ${result.stepsExecuted}단계 실행 (${((result.endTime - result.startTime) / 1000).toFixed(1)}초)${c.reset}\n`);
+        } else {
+          console.log(`\n${c.red}❌ 실패: ${result.error}${c.reset}\n`);
+        }
+      } catch (error) {
+        console.log(`${c.red}오류: ${(error as Error).message}${c.reset}\n`);
+      }
+      process.exit(0);
+    }
+
+    // /naver-blog <json> - 네이버 블로그 글쓰기 자동화 (CDP 모드)
+    if (arg === "/naver-blog" || arg === "naver-blog") {
+      const jsonPath = rawArgs[i + 1];
+      if (!jsonPath) {
+        console.log(`${c.red}사용법: naver-blog <post.json>${c.reset}`);
+        console.log(`${c.dim}예: npm start "naver-blog post.json"${c.reset}`);
+        process.exit(1);
+      }
+
+      // 파일 업로드는 extension 모드에서 불가
+      browserMode = "cdp";
+
+      const opts = loadNaverBlogPostOptionsFromJson(jsonPath);
+      const missionText = buildNaverBlogWriteMission(opts);
+
+      const model = resolveModel(config);
+      const isOllama = config.provider === "ollama";
+      await runAgent(missionText, model, isOllama);
+      process.exit(0);
+    }
+    if (arg.startsWith("/naver-blog ") || arg.startsWith("naver-blog ")) {
+      const jsonPath = arg.replace(/^\/?naver-blog\s+/, "").trim();
+      if (!jsonPath) {
+        console.log(`${c.red}사용법: naver-blog <post.json>${c.reset}`);
+        process.exit(1);
+      }
+      browserMode = "cdp";
+      const opts = loadNaverBlogPostOptionsFromJson(jsonPath);
+      const missionText = buildNaverBlogWriteMission(opts);
+      const model = resolveModel(config);
+      const isOllama = config.provider === "ollama";
+      await runAgent(missionText, model, isOllama);
+      process.exit(0);
     }
 
     // /web 또는 web - 웹 UI 모드 시작

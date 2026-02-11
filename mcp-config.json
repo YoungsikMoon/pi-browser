@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pi-browser": {
+      "command": "npx",
+      "args": ["tsx", "/Users/hunsangjo/Documents/projects/bot/pi-browser/src/mcp-server.ts"],
+      "env": {}
+    }
+  }
+}
